@@ -244,7 +244,7 @@ class Message(serializable.Serializable):
         self.data.set_state(state)
 
     data: MessageData
-    stream: Callable[[bytes], Iterable[bytes] | bytes] | bool = False
+    stream: Callable[[bytes], Iterable[bytes] | bytes] | Iterable[bytes] | bool = False
     """
     This attribute controls if the message body should be streamed.
 
@@ -254,6 +254,16 @@ class Message(serializable.Serializable):
     but immediately forwarded instead.
     Alternatively, a transformation function can be specified, which will be called for each chunk of data.
     Please note that packet boundaries generally should not be relied upon.
+
+    For addon-generated responses (where `flow.response` is set directly by an
+    addon), `stream` can also be set to an `Iterable[bytes]` (e.g. a generator)
+    that yields body chunks.  This allows serving large responses without
+    buffering the entire body in `raw_content`.  The addon must set
+    response headers (e.g. ``Content-Length``) itself.  Example::
+
+        flow.response = Response.make(200, b"")
+        flow.response.headers["content-length"] = str(file_size)
+        flow.response.stream = read_file_in_chunks(path)
 
     This attribute must be set in the `requestheaders` or `responseheaders` hook.
     Setting it in `request` or  `response` is already too late, mitmproxy has buffered the message body already.

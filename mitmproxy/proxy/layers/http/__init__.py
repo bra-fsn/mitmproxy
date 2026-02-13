@@ -514,16 +514,34 @@ class HttpStream(layer.Layer):
             return
 
         if not already_streamed:
-            content = self.flow.response.raw_content
-            done_after_headers = not (content or self.flow.response.trailers)
-            yield SendHttp(
-                ResponseHeaders(self.stream_id, self.flow.response, done_after_headers),
-                self.context.client,
-            )
-            if content:
+            stream = self.flow.response.stream
+            if stream and not isinstance(stream, bool) and not callable(stream):
+                # stream is an iterable body source (e.g. a generator yielding
+                # chunks).  This allows addons to produce large response bodies
+                # without buffering them entirely in raw_content.
                 yield SendHttp(
-                    ResponseData(self.stream_id, content), self.context.client
+                    ResponseHeaders(
+                        self.stream_id, self.flow.response, end_stream=False
+                    ),
+                    self.context.client,
                 )
+                for chunk in stream:
+                    yield SendHttp(
+                        ResponseData(self.stream_id, chunk), self.context.client
+                    )
+            else:
+                content = self.flow.response.raw_content
+                done_after_headers = not (content or self.flow.response.trailers)
+                yield SendHttp(
+                    ResponseHeaders(
+                        self.stream_id, self.flow.response, done_after_headers
+                    ),
+                    self.context.client,
+                )
+                if content:
+                    yield SendHttp(
+                        ResponseData(self.stream_id, content), self.context.client
+                    )
 
         if self.flow.response.trailers:
             yield SendHttp(
