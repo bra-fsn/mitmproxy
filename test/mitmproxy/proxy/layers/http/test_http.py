@@ -11,6 +11,7 @@ from mitmproxy.proxy import layer
 from mitmproxy.proxy.commands import CloseConnection
 from mitmproxy.proxy.commands import Log
 from mitmproxy.proxy.commands import OpenConnection
+from mitmproxy.proxy.commands import RequestWakeup
 from mitmproxy.proxy.commands import SendData
 from mitmproxy.proxy.events import ConnectionClosed
 from mitmproxy.proxy.events import DataReceived
@@ -347,6 +348,39 @@ def test_http_reply_from_proxy_streamed_empty(tctx):
             tctx.client,
             b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
         )
+    )
+
+
+def test_http_reply_from_proxy_streamed_backpressure(tctx):
+    """Test that iterable streams yield periodic wakeups for backpressure."""
+    # 9 chunks triggers one wakeup (DRAIN_EVERY=8 in send_response).
+    chunks = [bytes([i]) for i in range(9)]
+    body = b"".join(chunks)
+
+    def reply_streaming(flow: HTTPFlow):
+        flow.response = Response.make(200, b"")
+        flow.response.headers["content-length"] = str(len(body))
+        flow.response.stream = iter(chunks)
+
+    assert (
+        Playbook(http.HttpLayer(tctx, HTTPMode.regular), hooks=False)
+        >> DataReceived(
+            tctx.client,
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        << http.HttpRequestHook(Placeholder())
+        >> reply(side_effect=reply_streaming)
+        # Headers + first 8 chunks (merged into one SendData).
+        << SendData(
+            tctx.client,
+            b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\n"
+            + b"".join(chunks[:8]),
+        )
+        # Blocking wakeup gives the event loop a chance to drain.
+        << RequestWakeup(0)
+        >> reply()
+        # Remaining chunk after the drain.
+        << SendData(tctx.client, chunks[8])
     )
 
 

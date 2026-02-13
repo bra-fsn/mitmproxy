@@ -519,16 +519,25 @@ class HttpStream(layer.Layer):
                 # stream is an iterable body source (e.g. a generator yielding
                 # chunks).  This allows addons to produce large response bodies
                 # without buffering them entirely in raw_content.
+                #
+                # A blocking RequestWakeup(delay=0) is yielded periodically so
+                # the asyncio event loop can flush the transport write buffer,
+                # providing backpressure for large transfers.
                 yield SendHttp(
                     ResponseHeaders(
                         self.stream_id, self.flow.response, end_stream=False
                     ),
                     self.context.client,
                 )
-                for chunk in stream:
+                DRAIN_EVERY = 8  # chunks between drain opportunities
+                for i, chunk in enumerate(stream):
                     yield SendHttp(
                         ResponseData(self.stream_id, chunk), self.context.client
                     )
+                    if (i + 1) % DRAIN_EVERY == 0:
+                        wakeup = commands.RequestWakeup(delay=0)
+                        wakeup.blocking = True
+                        yield wakeup
             else:
                 content = self.flow.response.raw_content
                 done_after_headers = not (content or self.flow.response.trailers)

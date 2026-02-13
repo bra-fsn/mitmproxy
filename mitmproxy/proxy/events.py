@@ -136,3 +136,4 @@ class Wakeup(CommandCompleted):
     """
 
     command: commands.RequestWakeup
+    reply: None = None
