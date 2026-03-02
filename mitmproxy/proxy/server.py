@@ -30,12 +30,14 @@ from mitmproxy.connection import Address
 from mitmproxy.connection import Client
 from mitmproxy.connection import Connection
 from mitmproxy.connection import ConnectionState
+from mitmproxy.connection import Server
 from mitmproxy.proxy import commands
 from mitmproxy.proxy import events
 from mitmproxy.proxy import layer
 from mitmproxy.proxy import layers
 from mitmproxy.proxy import mode_specs
 from mitmproxy.proxy import server_hooks
+from mitmproxy.proxy.connection_pool import ConnectionPool
 from mitmproxy.proxy.context import Context
 from mitmproxy.proxy.layers.http import HTTPMode
 from mitmproxy.utils import asyncio_utils
@@ -102,12 +104,16 @@ class ConnectionHandler(metaclass=abc.ABCMeta):
     max_conns: collections.defaultdict[Address, asyncio.Semaphore]
     layer: "layer.Layer"
     wakeup_timer: set[asyncio.Task]
+    pool: ConnectionPool | None
+    pooled_connections: set[Connection]
 
-    def __init__(self, context: Context) -> None:
+    def __init__(self, context: Context, pool: ConnectionPool | None = None) -> None:
         self.client = context.client
         self.transports = {}
         self.max_conns = collections.defaultdict(lambda: asyncio.Semaphore(5))
         self.wakeup_timer = set()
+        self.pool = pool
+        self.pooled_connections: set[Connection] = set()
 
         # Ask for the first layer right away.
         # In a reverse proxy scenario, this is necessary as we would otherwise hang
@@ -171,13 +177,39 @@ class ConnectionHandler(metaclass=abc.ABCMeta):
 
         if self.transports:
             self.log("closing transports...", logging.DEBUG)
-            for io in self.transports.values():
-                if io.handler:
+            for conn, io in list(self.transports.items()):
+                if conn != self.client and self.pool and self._can_return_to_pool(conn, io):
+                    self._return_to_pool(conn, io)
+                elif io.handler:
                     io.handler.cancel("client disconnected")
-            await asyncio.wait(
-                [x.handler for x in self.transports.values() if x.handler]
-            )
+            remaining = [x.handler for x in self.transports.values() if x.handler]
+            if remaining:
+                await asyncio.wait(remaining)
             self.log("transports closed!", logging.DEBUG)
+
+    def _can_return_to_pool(self, connection: Connection, io: ConnectionIO) -> bool:
+        """Check if a server connection is eligible for pooling."""
+        return (
+            isinstance(connection, Server)
+            and connection.connected
+            and connection.address is not None
+            and not connection.error
+            and io.reader is not None
+            and io.writer is not None
+        )
+
+    def _return_to_pool(self, connection: Connection, io: ConnectionIO) -> None:
+        """Return a server connection to the global pool for reuse by other clients."""
+        assert isinstance(connection, Server)
+        assert io.reader is not None and io.writer is not None
+        if io.handler:
+            io.handler.cancel("returned to pool")
+        accepted = self.pool.put(connection, io.reader, io.writer)
+        if accepted:
+            self.log(f"server connection to {human.format_address(connection.address)} returned to pool", logging.DEBUG)
+            self.transports.pop(connection, None)
+        else:
+            self.log(f"pool rejected connection to {human.format_address(connection.address)}", logging.DEBUG)
 
     async def open_connection(self, command: commands.OpenConnection) -> None:
         if not command.connection.address:
@@ -188,6 +220,51 @@ class ConnectionHandler(metaclass=abc.ABCMeta):
                 )
             )
             return
+
+        # Try to acquire an idle connection from the global pool.
+        if self.pool and isinstance(command.connection, Server):
+            pooled = self.pool.get(
+                command.connection.address,
+                command.connection.tls,
+                command.connection.via,
+                command.connection.transport_protocol,
+            )
+            if pooled is not None:
+                command.connection.state = pooled.connection.state
+                command.connection.peername = pooled.connection.peername
+                command.connection.sockname = pooled.connection.sockname
+                command.connection.timestamp_start = pooled.connection.timestamp_start
+                command.connection.timestamp_tcp_setup = pooled.connection.timestamp_tcp_setup
+                command.connection.timestamp_tls_setup = pooled.connection.timestamp_tls_setup
+                command.connection.tls = pooled.connection.tls
+                command.connection.alpn = pooled.connection.alpn
+                command.connection.certificate_list = pooled.connection.certificate_list
+                command.connection.tls_version = pooled.connection.tls_version
+                command.connection.sni = pooled.connection.sni
+
+                self.transports[command.connection] = ConnectionIO(
+                    handler=asyncio.current_task(),
+                    reader=pooled.reader,
+                    writer=pooled.writer,
+                )
+                self.pooled_connections.add(command.connection)
+
+                addr = human.format_address(command.connection.address)
+                self.log(f"server connect {addr} (from pool)")
+                await self.server_event(events.OpenConnectionCompleted(command, None))
+
+                try:
+                    await self.handle_connection(command.connection)
+                finally:
+                    self.log(f"server disconnect {addr} (was pooled)")
+                    command.connection.timestamp_end = time.time()
+                    hook_data = server_hooks.ServerConnectionHookData(
+                        client=self.client, server=command.connection
+                    )
+                    await self.handle_hook(
+                        server_hooks.ServerDisconnectedHook(hook_data)
+                    )
+                return
 
         hook_data = server_hooks.ServerConnectionHookData(
             client=self.client, server=command.connection
@@ -469,6 +546,7 @@ class LiveConnectionHandler(ConnectionHandler, metaclass=abc.ABCMeta):
         writer: asyncio.StreamWriter | mitmproxy_rs.Stream,
         options: moptions.Options,
         mode: mode_specs.ProxyMode,
+        pool: ConnectionPool | None = None,
     ) -> None:
         client = Client(
             transport_protocol=writer.get_extra_info("transport_protocol", "tcp"),
@@ -479,7 +557,7 @@ class LiveConnectionHandler(ConnectionHandler, metaclass=abc.ABCMeta):
             state=ConnectionState.OPEN,
         )
         context = Context(client, options)
-        super().__init__(context)
+        super().__init__(context, pool=pool)
         self.transports[client] = ConnectionIO(
             handler=None, reader=reader, writer=writer
         )
@@ -490,8 +568,8 @@ class SimpleConnectionHandler(LiveConnectionHandler):  # pragma: no cover
 
     hook_handlers: dict[str, Callable]
 
-    def __init__(self, reader, writer, options, mode, hook_handlers):
-        super().__init__(reader, writer, options, mode)
+    def __init__(self, reader, writer, options, mode, hook_handlers, pool=None):
+        super().__init__(reader, writer, options, mode, pool=pool)
         self.hook_handlers = hook_handlers
 
     async def handle_hook(self, hook: commands.StartHook) -> None:

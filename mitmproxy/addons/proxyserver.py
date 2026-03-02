@@ -28,6 +28,7 @@ from mitmproxy.flow import Flow
 from mitmproxy.proxy import events
 from mitmproxy.proxy import mode_specs
 from mitmproxy.proxy import server_hooks
+from mitmproxy.proxy.connection_pool import ConnectionPool
 from mitmproxy.proxy.layers.tcp import TcpMessageInjected
 from mitmproxy.proxy.layers.udp import UdpMessageInjected
 from mitmproxy.proxy.layers.websocket import WebSocketMessageInjected
@@ -117,6 +118,7 @@ class Proxyserver(ServerManager):
 
     connections: dict[tuple | str, ProxyConnectionHandler]
     servers: Servers
+    connection_pool: ConnectionPool | None
 
     is_running: bool
     _connect_addr: Address | None = None
@@ -125,6 +127,7 @@ class Proxyserver(ServerManager):
         self.connections = {}
         self.servers = Servers(self)
         self.is_running = False
+        self.connection_pool = None
 
     def __repr__(self):
         return f"Proxyserver({len(self.connections)} active conns)"
@@ -221,9 +224,54 @@ class Proxyserver(ServerManager):
             None,
             """Set the local IP address that mitmproxy should use when connecting to upstream servers.""",
         )
+        loader.add_option(
+            "upstream_connection_pool",
+            bool,
+            False,
+            """Enable a global connection pool for upstream server connections.
+            When enabled, idle server connections are kept alive and reused across different
+            client connections, avoiding repeated TCP handshakes and TLS negotiations.""",
+        )
+        loader.add_option(
+            "upstream_connection_pool_idle_timeout",
+            int,
+            30,
+            """How long (in seconds) to keep idle connections in the upstream connection pool.
+            Only has an effect when upstream_connection_pool is enabled.""",
+        )
+        loader.add_option(
+            "upstream_connection_pool_max_per_host",
+            int,
+            5,
+            """Maximum number of idle connections to keep per upstream host in the connection pool.
+            Only has an effect when upstream_connection_pool is enabled.""",
+        )
 
     def running(self):
         self.is_running = True
+        self._update_connection_pool()
+
+    def _update_connection_pool(self) -> None:
+        """Create or tear down the connection pool based on current options."""
+        if ctx.options.upstream_connection_pool:
+            if self.connection_pool is None:
+                self.connection_pool = ConnectionPool(
+                    idle_timeout=ctx.options.upstream_connection_pool_idle_timeout,
+                    max_per_key=ctx.options.upstream_connection_pool_max_per_host,
+                )
+                self.connection_pool.start()
+                logger.info("Upstream connection pool enabled.")
+            else:
+                self.connection_pool._idle_timeout = ctx.options.upstream_connection_pool_idle_timeout
+                self.connection_pool._max_per_key = ctx.options.upstream_connection_pool_max_per_host
+        else:
+            if self.connection_pool is not None:
+                asyncio_utils.create_task(
+                    self.connection_pool.close(),
+                    name="close connection pool",
+                    keep_ref=True,
+                )
+                self.connection_pool = None
 
     def configure(self, updated) -> None:
         if "stream_large_bodies" in updated:
@@ -255,6 +303,15 @@ class Proxyserver(ServerManager):
                 raise exceptions.OptionsError(
                     f"Invalid value for connect_addr: {ctx.options.connect_addr!r}. Specify a valid IP address."
                 )
+        if any(
+            k in updated for k in (
+                "upstream_connection_pool",
+                "upstream_connection_pool_idle_timeout",
+                "upstream_connection_pool_max_per_host",
+            )
+        ):
+            if self.is_running:
+                self._update_connection_pool()
         if "mode" in updated or "server" in updated:
             # Make sure that all modes are syntactically valid...
             modes: list[mode_specs.ProxyMode] = []

@@ -43,6 +43,7 @@ from mitmproxy.proxy import commands
 from mitmproxy.proxy import layers
 from mitmproxy.proxy import mode_specs
 from mitmproxy.proxy import server
+from mitmproxy.proxy.connection_pool import ConnectionPool
 from mitmproxy.proxy.context import Context
 from mitmproxy.proxy.layer import Layer
 from mitmproxy.utils import human
@@ -61,9 +62,9 @@ logger = logging.getLogger(__name__)
 class ProxyConnectionHandler(server.LiveConnectionHandler):
     master: Master
 
-    def __init__(self, master, r, w, options, mode):
+    def __init__(self, master, r, w, options, mode, pool=None):
         self.master = master
-        super().__init__(r, w, options, mode)
+        super().__init__(r, w, options, mode, pool=pool)
         self.log_prefix = f"{human.format_address(self.client.peername)}: "
 
     async def handle_hook(self, hook: commands.StartHook) -> None:
@@ -81,6 +82,7 @@ M = TypeVar("M", bound=mode_specs.ProxyMode)
 class ServerManager(typing.Protocol):
     # temporary workaround: for UDP, we use the 4-tuple because we don't have a uuid.
     connections: dict[tuple | str, ProxyConnectionHandler]
+    connection_pool: ConnectionPool | None
 
     @contextmanager
     def register_connection(
@@ -191,7 +193,8 @@ class ServerInstance(Generic[M], metaclass=ABCMeta):
             assert isinstance(reader, mitmproxy_rs.Stream)
             writer = reader
         handler = ProxyConnectionHandler(
-            ctx.master, reader, writer, ctx.options, self.mode
+            ctx.master, reader, writer, ctx.options, self.mode,
+            pool=self.manager.connection_pool,
         )
         handler.layer = self.make_top_layer(handler.layer.context)
         if isinstance(self.mode, mode_specs.TransparentMode):
