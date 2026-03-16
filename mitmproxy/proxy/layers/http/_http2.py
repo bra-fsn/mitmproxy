@@ -21,7 +21,6 @@ from ...commands import CloseConnection
 from ...commands import Log
 from ...commands import RequestWakeup
 from ...commands import SendData
-from ...commands import SetSendBufferFullCallback
 from ...context import Context
 from ...events import ConnectionClosed
 from ...events import DataReceived
@@ -125,9 +124,6 @@ class Http2Connection(HttpConnection):
         if isinstance(event, Start):
             self.h2_conn.initiate_connection()
             yield SendData(self.conn, self.h2_conn.data_to_send())
-            yield SetSendBufferFullCallback(
-                self.conn, lambda: self.h2_conn.is_send_buffer_full
-            )
 
         elif isinstance(event, HttpEvent):
             if isinstance(event, (RequestData, ResponseData)):

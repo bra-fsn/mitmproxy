@@ -138,8 +138,6 @@ class TunnelLayer(layer.Layer):
                     self.tunnel_state = TunnelState.CLOSED
                 else:
                     yield from self.start_handshake()
-            elif isinstance(command, commands.SetSendBufferFullCallback):
-                yield command
             else:  # pragma: no cover
                 raise AssertionError(f"Unexpected command: {command}")
         else:

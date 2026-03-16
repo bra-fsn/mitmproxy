@@ -11,7 +11,6 @@ import abc
 import asyncio
 import collections
 import logging
-import os
 import time
 from collections.abc import Awaitable
 from collections.abc import Callable
@@ -39,6 +38,7 @@ from mitmproxy.proxy import mode_specs
 from mitmproxy.proxy import server_hooks
 from mitmproxy.proxy.context import Context
 from mitmproxy.proxy.layers.http import HTTPMode
+from mitmproxy.proxy.layers.http._http_h2 import BufferedH2Connection
 from mitmproxy.utils import asyncio_utils
 from mitmproxy.utils import human
 from mitmproxy.utils.data import pkg_data
@@ -94,7 +94,6 @@ class ConnectionIO:
     handler: asyncio.Task | None = None
     reader: asyncio.StreamReader | mitmproxy_rs.Stream | None = None
     writer: asyncio.StreamWriter | mitmproxy_rs.Stream | None = None
-    is_send_buffer_full: "Callable[[], bool] | None" = None
 
 
 class ConnectionHandler(metaclass=abc.ABCMeta):
@@ -297,13 +296,8 @@ class ConnectionHandler(metaclass=abc.ABCMeta):
 
             try:
                 await self.drain_writers()
-                if connection != self.client and not os.environ.get("MITMPROXY_NO_H2_BACKPRESSURE"):
-                    while any(
-                        t.is_send_buffer_full is not None and t.is_send_buffer_full()
-                        for t in self.transports.values()
-                    ):
-                        await asyncio.sleep(0.05)
-                        await self.drain_writers()
+                if connection != self.client:
+                    await BufferedH2Connection.wait_for_send_buffers()
             except asyncio.CancelledError as e:
                 cancelled = e
                 break
@@ -440,10 +434,6 @@ class ConnectionHandler(metaclass=abc.ABCMeta):
                         )
                     elif isinstance(command, commands.Log):
                         self.log(command.message, command.level)
-                    elif isinstance(command, commands.SetSendBufferFullCallback):
-                        transport = self.transports.get(command.connection)
-                        if transport is not None:
-                            transport.is_send_buffer_full = command.callback
                     else:
                         raise RuntimeError(f"Unexpected command: {command}")
             except Exception:

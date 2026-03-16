@@ -1,3 +1,4 @@
+import asyncio
 import collections
 import logging
 import weakref
@@ -12,7 +13,8 @@ import h2.stream
 
 logger = logging.getLogger(__name__)
 
-MAX_SEND_BUFFER_SIZE = 64 * 1024 * 1024  # 64 MiB per connection
+SEND_BUFFER_HIGH_WATERMARK = 32 * 1024 * 1024  # 32 MiB: pause upstream reads
+SEND_BUFFER_LOW_WATERMARK = 16 * 1024 * 1024  # 16 MiB: resume upstream reads
 
 
 class H2ConnectionLogger(h2.config.DummyLogger):
@@ -60,15 +62,25 @@ class BufferedH2Connection(h2.connection.H2Connection):
         self.stream_buffers = collections.defaultdict(collections.deque)
         self.stream_trailers = {}
         self._buffered_bytes = 0
+        self._drain_event = asyncio.Event()
+        self._drain_event.set()  # starts drained (not full)
         BufferedH2Connection._instances.add(self)
+
+    def _check_watermarks(self) -> None:
+        if self._buffered_bytes >= SEND_BUFFER_HIGH_WATERMARK:
+            self._drain_event.clear()
+        elif self._buffered_bytes < SEND_BUFFER_LOW_WATERMARK:
+            self._drain_event.set()
+
+    @classmethod
+    async def wait_for_send_buffers(cls) -> None:
+        """Block until all instances' send buffers are below the high watermark."""
+        for inst in list(cls._instances):
+            await inst._drain_event.wait()
 
     @property
     def buffered_bytes(self) -> int:
         return self._buffered_bytes
-
-    @property
-    def is_send_buffer_full(self) -> bool:
-        return self._buffered_bytes >= MAX_SEND_BUFFER_SIZE
 
     def initiate_connection(self):
         super().initiate_connection()
@@ -99,6 +111,7 @@ class BufferedH2Connection(h2.connection.H2Connection):
                 chunk = data[start : start + self.max_outbound_frame_size]
                 self.send_data(stream_id, chunk, end_stream=False)
 
+            self._check_watermarks()
             return
 
         if self.stream_buffers.get(stream_id, None):
@@ -117,6 +130,7 @@ class BufferedH2Connection(h2.connection.H2Connection):
                 # We can't send right now, so we buffer.
                 self.stream_buffers[stream_id].append(SendH2Data(data, end_stream))
                 self._buffered_bytes += len(data)
+        self._check_watermarks()
 
     def send_trailers(self, stream_id: int, trailers: list[tuple[bytes, bytes]]):
         if self.stream_buffers.get(stream_id, None):
@@ -134,6 +148,7 @@ class BufferedH2Connection(h2.connection.H2Connection):
         buf = self.stream_buffers.pop(stream_id, None)
         if buf:
             self._buffered_bytes -= sum(len(c.data) for c in buf)
+            self._check_watermarks()
         super().reset_stream(stream_id, error_code)
 
     def receive_data(self, data: bytes):
@@ -160,6 +175,7 @@ class BufferedH2Connection(h2.connection.H2Connection):
                 self._buffered_bytes = 0
                 self.stream_buffers.clear()
             ret.append(event)
+        self._check_watermarks()
         return ret
 
     def stream_window_updated(self, stream_id: int) -> bool:
@@ -180,6 +196,7 @@ class BufferedH2Connection(h2.connection.H2Connection):
             buf = self.stream_buffers.pop(stream_id, None)
             if buf:
                 self._buffered_bytes -= sum(len(c.data) for c in buf)
+                self._check_watermarks()
             return False
 
         available_window = self.local_flow_control_window(stream_id)
@@ -211,6 +228,7 @@ class BufferedH2Connection(h2.connection.H2Connection):
                     )
             sent_any_data = True
 
+        self._check_watermarks()
         return sent_any_data
 
     def connection_window_updated(self) -> None:
