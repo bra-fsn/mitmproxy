@@ -13,8 +13,9 @@ import h2.stream
 
 logger = logging.getLogger(__name__)
 
-SEND_BUFFER_HIGH_WATERMARK = 32 * 1024 * 1024  # 32 MiB: pause upstream reads
-SEND_BUFFER_LOW_WATERMARK = 16 * 1024 * 1024  # 16 MiB: resume upstream reads
+SEND_BUFFER_HIGH_WATERMARK = 4 * 1024 * 1024  # 4 MiB: pause upstream reads
+SEND_BUFFER_LOW_WATERMARK = 2 * 1024 * 1024  # 2 MiB: resume upstream reads
+SEND_BUFFER_DRAIN_TIMEOUT = 5.0  # seconds: max time to wait for buffers to drain
 
 
 class H2ConnectionLogger(h2.config.DummyLogger):
@@ -74,9 +75,21 @@ class BufferedH2Connection(h2.connection.H2Connection):
 
     @classmethod
     async def wait_for_send_buffers(cls) -> None:
-        """Block until all instances' send buffers are below the high watermark."""
+        """Block until all instances' send buffers are below the high watermark.
+
+        Uses a timeout to prevent indefinite stalls when a slow client causes
+        the stop-and-go pattern to last longer than acceptable.
+        """
         for inst in list(cls._instances):
-            await inst._drain_event.wait()
+            try:
+                await asyncio.wait_for(
+                    inst._drain_event.wait(), timeout=SEND_BUFFER_DRAIN_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "Send buffer drain timeout (buffered=%d bytes), proceeding",
+                    inst._buffered_bytes,
+                )
 
     @property
     def buffered_bytes(self) -> int:
