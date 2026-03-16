@@ -1,5 +1,6 @@
 import collections
 import logging
+import weakref
 from typing import NamedTuple
 
 import h2.config
@@ -46,6 +47,7 @@ class BufferedH2Connection(h2.connection.H2Connection):
     To simplify implementation, padding is unsupported.
     """
 
+    _instances: weakref.WeakSet["BufferedH2Connection"] = weakref.WeakSet()
     stream_buffers: collections.defaultdict[int, collections.deque[SendH2Data]]
     stream_trailers: dict[int, list[tuple[bytes, bytes]]]
 
@@ -54,11 +56,11 @@ class BufferedH2Connection(h2.connection.H2Connection):
         self.local_settings.initial_window_size = 2**31 - 1
         self.local_settings.max_frame_size = 2**17
         self.max_inbound_frame_size = 2**17
-        # hyper-h2 pitfall: we need to acknowledge here, otherwise its sends out the old settings.
         self.local_settings.acknowledge()
         self.stream_buffers = collections.defaultdict(collections.deque)
         self.stream_trailers = {}
         self._buffered_bytes = 0
+        BufferedH2Connection._instances.add(self)
 
     @property
     def buffered_bytes(self) -> int:

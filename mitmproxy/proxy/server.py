@@ -11,6 +11,7 @@ import abc
 import asyncio
 import collections
 import logging
+import os
 import time
 from collections.abc import Awaitable
 from collections.abc import Callable
@@ -296,7 +297,7 @@ class ConnectionHandler(metaclass=abc.ABCMeta):
 
             try:
                 await self.drain_writers()
-                if connection != self.client:
+                if connection != self.client and not os.environ.get("MITMPROXY_NO_H2_BACKPRESSURE"):
                     while any(
                         t.is_send_buffer_full is not None and t.is_send_buffer_full()
                         for t in self.transports.values()
