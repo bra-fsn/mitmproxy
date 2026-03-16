@@ -9,6 +9,7 @@ The counterpart to commands are events.
 
 import logging
 import warnings
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 from typing import Union
 
@@ -157,3 +158,17 @@ class Log(Command):
 
     def __repr__(self):
         return f"Log({self.message!r}, {logging.getLevelName(self.level).lower()})"
+
+
+class SetSendBufferFullCallback(ConnectionCommand):
+    """
+    Register a callback that returns True when the H2 send buffer for this
+    connection is above its high-water mark. Used by the server to apply
+    backpressure by pausing upstream reads.
+    """
+
+    callback: "Callable[[], bool]"
+
+    def __init__(self, connection: Connection, callback: "Callable[[], bool]"):
+        super().__init__(connection)
+        self.callback = callback

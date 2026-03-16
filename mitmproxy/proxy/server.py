@@ -93,6 +93,7 @@ class ConnectionIO:
     handler: asyncio.Task | None = None
     reader: asyncio.StreamReader | mitmproxy_rs.Stream | None = None
     writer: asyncio.StreamWriter | mitmproxy_rs.Stream | None = None
+    is_send_buffer_full: "Callable[[], bool] | None" = None
 
 
 class ConnectionHandler(metaclass=abc.ABCMeta):
@@ -295,6 +296,13 @@ class ConnectionHandler(metaclass=abc.ABCMeta):
 
             try:
                 await self.drain_writers()
+                if connection != self.client:
+                    while any(
+                        t.is_send_buffer_full is not None and t.is_send_buffer_full()
+                        for t in self.transports.values()
+                    ):
+                        await asyncio.sleep(0.05)
+                        await self.drain_writers()
             except asyncio.CancelledError as e:
                 cancelled = e
                 break
@@ -431,6 +439,10 @@ class ConnectionHandler(metaclass=abc.ABCMeta):
                         )
                     elif isinstance(command, commands.Log):
                         self.log(command.message, command.level)
+                    elif isinstance(command, commands.SetSendBufferFullCallback):
+                        transport = self.transports.get(command.connection)
+                        if transport is not None:
+                            transport.is_send_buffer_full = command.callback
                     else:
                         raise RuntimeError(f"Unexpected command: {command}")
             except Exception:

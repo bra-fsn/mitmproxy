@@ -11,6 +11,8 @@ import h2.stream
 
 logger = logging.getLogger(__name__)
 
+MAX_SEND_BUFFER_SIZE = 64 * 1024 * 1024  # 64 MiB per connection
+
 
 class H2ConnectionLogger(h2.config.DummyLogger):
     def __init__(self, peername: tuple, conn_type: str):
@@ -56,6 +58,15 @@ class BufferedH2Connection(h2.connection.H2Connection):
         self.local_settings.acknowledge()
         self.stream_buffers = collections.defaultdict(collections.deque)
         self.stream_trailers = {}
+        self._buffered_bytes = 0
+
+    @property
+    def buffered_bytes(self) -> int:
+        return self._buffered_bytes
+
+    @property
+    def is_send_buffer_full(self) -> bool:
+        return self._buffered_bytes >= MAX_SEND_BUFFER_SIZE
 
     def initiate_connection(self):
         super().initiate_connection()
@@ -91,6 +102,7 @@ class BufferedH2Connection(h2.connection.H2Connection):
         if self.stream_buffers.get(stream_id, None):
             # We already have some data buffered, let's append.
             self.stream_buffers[stream_id].append(SendH2Data(data, end_stream))
+            self._buffered_bytes += len(data)
         else:
             available_window = self.local_flow_control_window(stream_id)
             if frame_size <= available_window:
@@ -102,6 +114,7 @@ class BufferedH2Connection(h2.connection.H2Connection):
                     data = data[available_window:]
                 # We can't send right now, so we buffer.
                 self.stream_buffers[stream_id].append(SendH2Data(data, end_stream))
+                self._buffered_bytes += len(data)
 
     def send_trailers(self, stream_id: int, trailers: list[tuple[bytes, bytes]]):
         if self.stream_buffers.get(stream_id, None):
@@ -116,7 +129,9 @@ class BufferedH2Connection(h2.connection.H2Connection):
         self.send_data(stream_id, b"", end_stream=True)
 
     def reset_stream(self, stream_id: int, error_code: int = 0) -> None:
-        self.stream_buffers.pop(stream_id, None)
+        buf = self.stream_buffers.pop(stream_id, None)
+        if buf:
+            self._buffered_bytes -= sum(len(c.data) for c in buf)
         super().reset_stream(stream_id, error_code)
 
     def receive_data(self, data: bytes):
@@ -136,8 +151,11 @@ class BufferedH2Connection(h2.connection.H2Connection):
                 ):
                     self.connection_window_updated()
             elif isinstance(event, h2.events.StreamReset):
-                self.stream_buffers.pop(event.stream_id, None)
+                buf = self.stream_buffers.pop(event.stream_id, None)
+                if buf:
+                    self._buffered_bytes -= sum(len(c.data) for c in buf)
             elif isinstance(event, h2.events.ConnectionTerminated):
+                self._buffered_bytes = 0
                 self.stream_buffers.clear()
             ret.append(event)
         return ret
@@ -157,21 +175,24 @@ class BufferedH2Connection(h2.connection.H2Connection):
                 h2.stream.StreamState.HALF_CLOSED_REMOTE,
             )
         if stream_was_reset:
-            self.stream_buffers.pop(stream_id, None)
+            buf = self.stream_buffers.pop(stream_id, None)
+            if buf:
+                self._buffered_bytes -= sum(len(c.data) for c in buf)
             return False
 
         available_window = self.local_flow_control_window(stream_id)
         sent_any_data = False
         while available_window > 0 and stream_id in self.stream_buffers:
             chunk: SendH2Data = self.stream_buffers[stream_id].popleft()
+            self._buffered_bytes -= len(chunk.data)
             if len(chunk.data) > available_window:
                 # We can't send the entire chunk, so we have to put some bytes back into the buffer.
-                self.stream_buffers[stream_id].appendleft(
-                    SendH2Data(
-                        data=chunk.data[available_window:],
-                        end_stream=chunk.end_stream,
-                    )
+                leftover = SendH2Data(
+                    data=chunk.data[available_window:],
+                    end_stream=chunk.end_stream,
                 )
+                self.stream_buffers[stream_id].appendleft(leftover)
+                self._buffered_bytes += len(leftover.data)
                 chunk = SendH2Data(
                     data=chunk.data[:available_window],
                     end_stream=False,
